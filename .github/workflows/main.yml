@@ -1,0 +1,587 @@
+name: Build PagePilot Loop APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Project Files
+        run: |
+          mkdir -p app/src/main/java/com/pagepilot
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PagePilot"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.pagepilot"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.pagepilot"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "1.1-loop"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PagerService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:description="@string/accessibility_desc"
+              android:notificationTimeout="100" />
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">PagePilot</string>
+              <string name="accessibility_desc">用於自動滑動PPT並在到達最後一頁後自動滑回第一頁循環播放</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/pagepilot/Prefs.kt
+          package com.pagepilot
+
+          import android.content.Context
+          import android.content.SharedPreferences
+
+          class Prefs(context: Context) {
+              val sp: SharedPreferences =
+                  context.getSharedPreferences("page_pilot_prefs", Context.MODE_PRIVATE)
+
+              var intervalMs: Long
+                  get() = sp.getLong("interval_ms", 5000L).coerceAtLeast(500L)
+                  set(value) = sp.edit().putLong("interval_ms", value.coerceAtLeast(500L)).apply()
+
+              var totalPages: Int
+                  get() = sp.getInt("total_pages", 10).coerceAtLeast(2)
+                  set(value) = sp.edit().putInt("total_pages", value.coerceAtLeast(2)).apply()
+
+              var isLoopEnabled: Boolean
+                  get() = sp.getBoolean("is_loop_enabled", true)
+                  set(value) = sp.edit().putBoolean("is_loop_enabled", value).apply()
+
+              var rewindStepMs: Long
+                  get() = sp.getLong("rewind_step_ms", 350L).coerceAtLeast(150L)
+                  set(value) = sp.edit().putLong("rewind_step_ms", value.coerceAtLeast(150L)).apply()
+
+              var isVertical: Boolean
+                  get() = sp.getBoolean("is_vertical", true)
+                  set(value) = sp.edit().putBoolean("is_vertical", value).apply()
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/pagepilot/AutoPagerLogic.kt
+          package com.pagepilot
+
+          import android.os.Handler
+          import android.os.Looper
+
+          class AutoPagerLogic(
+              private val prefs: Prefs,
+              private val onForwardSwipe: () -> Unit,
+              private val onBackwardSwipe: () -> Unit,
+              private val onStateChanged: (currentPage: Int, totalPages: Int, isRunning: Boolean, isRewinding: Boolean) -> Unit
+          ) {
+              private val handler = Handler(Looper.getMainLooper())
+              var isRunning = false
+                  private set
+              var isRewinding = false
+                  private set
+              var currentPage = 1
+                  private set
+
+              private val tickRunnable = object : Runnable {
+                  override fun run() {
+                      if (!isRunning || isRewinding) return
+
+                      val total = prefs.totalPages
+                      val loop = prefs.isLoopEnabled
+
+                      if (currentPage < total) {
+                          onForwardSwipe()
+                          currentPage++
+                          notifyState()
+                          handler.postDelayed(this, prefs.intervalMs)
+                      } else {
+                          if (loop) {
+                              startRewindToFirstPage(total)
+                          } else {
+                              stop()
+                          }
+                      }
+                  }
+              }
+
+              private fun startRewindToFirstPage(total: Int) {
+                  isRewinding = true
+                  notifyState()
+
+                  var remainSwipes = total
+
+                  val rewindRunnable = object : Runnable {
+                      override fun run() {
+                          if (!isRunning) {
+                              isRewinding = false
+                              notifyState()
+                              return
+                          }
+                          if (remainSwipes > 0) {
+                              onBackwardSwipe()
+                              remainSwipes--
+                              currentPage = (currentPage - 1).coerceAtLeast(1)
+                              notifyState()
+                              handler.postDelayed(this, prefs.rewindStepMs)
+                          } else {
+                              currentPage = 1
+                              isRewinding = false
+                              notifyState()
+                              handler.postDelayed(tickRunnable, prefs.intervalMs)
+                          }
+                      }
+                  }
+
+                  handler.postDelayed(rewindRunnable, 300L)
+              }
+
+              fun start() {
+                  if (isRunning) return
+                  isRunning = true
+                  isRewinding = false
+                  if (currentPage > prefs.totalPages) {
+                      currentPage = 1
+                  }
+                  notifyState()
+                  handler.postDelayed(tickRunnable, prefs.intervalMs)
+              }
+
+              fun stop() {
+                  isRunning = false
+                  isRewinding = false
+                  handler.removeCallbacksAndMessages(null)
+                  notifyState()
+              }
+
+              fun resetToFirstPage() {
+                  val wasRunning = isRunning
+                  stop()
+                  currentPage = 1
+                  notifyState()
+                  if (wasRunning) {
+                      start()
+                  }
+              }
+
+              fun notifyState() {
+                  onStateChanged(currentPage, prefs.totalPages, isRunning, isRewinding)
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/pagepilot/PagerService.kt
+          package com.pagepilot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class PagerService : AccessibilityService() {
+
+              private lateinit var prefs: Prefs
+              private lateinit var logic: AutoPagerLogic
+              private var windowManager: WindowManager? = null
+              private var overlayView: LinearLayout? = null
+              private var statusText: TextView? = null
+              private var toggleBtn: Button? = null
+
+              private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+                  logic.notifyState()
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  prefs = Prefs(this)
+                  logic = AutoPagerLogic(
+                      prefs = prefs,
+                      onForwardSwipe = { performSwipe(isForward = true) },
+                      onBackwardSwipe = { performSwipe(isForward = false) },
+                      onStateChanged = { page, total, running, rewinding ->
+                          updateOverlayUI(page, total, running, rewinding)
+                      }
+                  )
+                  prefs.sp.registerOnSharedPreferenceChangeListener(prefListener)
+                  showFloatingBar()
+                  logic.notifyState()
+              }
+
+              private fun performSwipe(isForward: Boolean) {
+                  val metrics: DisplayMetrics = resources.displayMetrics
+                  val w = metrics.widthPixels.toFloat()
+                  val h = metrics.heightPixels.toFloat()
+
+                  val path = Path()
+                  if (prefs.isVertical) {
+                      val centerX = w * 0.5f
+                      val startY = if (isForward) h * 0.78f else h * 0.22f
+                      val endY = if (isForward) h * 0.22f else h * 0.78f
+                      path.moveTo(centerX, startY)
+                      path.lineTo(centerX, endY)
+                  } else {
+                      val centerY = h * 0.5f
+                      val startX = if (isForward) w * 0.82f else w * 0.18f
+                      val endX = if (isForward) w * 0.18f else w * 0.82f
+                      path.moveTo(startX, centerY)
+                      path.lineTo(endX, centerY)
+                  }
+
+                  val duration = if (isForward) 220L else 120L
+                  val stroke = GestureDescription.StrokeDescription(path, 0L, duration)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  dispatchGesture(gesture, null, null)
+              }
+
+              private fun showFloatingBar() {
+                  if (overlayView != null) return
+                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+
+                  val params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 40
+                      y = 120
+                  }
+
+                  val container = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(24, 14, 24, 14)
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#CC1E1E2E"))
+                          cornerRadius = 36f
+                      }
+                  }
+
+                  statusText = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      text = "第 1/${prefs.totalPages} 頁"
+                      setPadding(8, 0, 20, 0)
+                  }
+
+                  toggleBtn = Button(this).apply {
+                      text = "開始"
+                      textSize = 12f
+                      setPadding(20, 6, 20, 6)
+                      setOnClickListener {
+                          if (logic.isRunning) logic.stop() else logic.start()
+                      }
+                  }
+
+                  val resetBtn = Button(this).apply {
+                      text = "重置"
+                      textSize = 12f
+                      setPadding(20, 6, 20, 6)
+                      setOnClickListener {
+                          logic.resetToFirstPage()
+                      }
+                  }
+
+                  var initialX = 0
+                  var initialY = 0
+                  var touchX = 0f
+                  var touchY = 0f
+                  statusText?.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initialX = params.x
+                              initialY = params.y
+                              touchX = event.rawX
+                              touchY = event.rawY
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              params.x = initialX + (event.rawX - touchX).toInt()
+                              params.y = initialY + (event.rawY - touchY).toInt()
+                              windowManager?.updateViewLayout(container, params)
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+
+                  container.addView(statusText)
+                  container.addView(toggleBtn)
+                  container.addView(resetBtn)
+
+                  overlayView = container
+                  windowManager?.addView(container, params)
+              }
+
+              private fun updateOverlayUI(page: Int, total: Int, running: Boolean, rewinding: Boolean) {
+                  statusText?.text = if (rewinding) {
+                      "回第1頁中 ($page/$total)"
+                  } else {
+                      "第 $page/$total 頁"
+                  }
+                  toggleBtn?.text = if (running) "暫停" else "開始"
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {
+                  logic.stop()
+              }
+
+              override fun onDestroy() {
+                  prefs.sp.unregisterOnSharedPreferenceChangeListener(prefListener)
+                  logic.stop()
+                  overlayView?.let { windowManager?.removeView(it) }
+                  overlayView = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/pagepilot/MainActivity.kt
+          package com.pagepilot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = Prefs(this)
+
+                  val root = ScrollView(this)
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 48, 48, 48)
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "PagePilot - PPT 自動循環翻頁"
+                      textSize = 20f
+                      setPadding(0, 0, 0, 32)
+                  }
+                  layout.addView(title)
+
+                  layout.addView(TextView(this).apply { text = "PPT 總頁數（滑到底後自動回第 1 頁）：" })
+                  val totalPagesInput = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setText(prefs.totalPages.toString())
+                  }
+                  layout.addView(totalPagesInput)
+
+                  layout.addView(TextView(this).apply {
+                      text = "每頁停留時間（毫秒，如 5000 = 5秒）："
+                      setPadding(0, 24, 0, 0)
+                  })
+                  val intervalInput = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setText(prefs.intervalMs.toString())
+                  }
+                  layout.addView(intervalInput)
+
+                  layout.addView(TextView(this).apply {
+                      text = "到底後往回快滑間隔（毫秒，建議 300~500）："
+                      setPadding(0, 24, 0, 0)
+                  })
+                  val rewindInput = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setText(prefs.rewindStepMs.toString())
+                  }
+                  layout.addView(rewindInput)
+
+                  val loopSwitch = Switch(this).apply {
+                      text = "開啟到底後自動循環回第 1 頁"
+                      isChecked = prefs.isLoopEnabled
+                      setPadding(0, 24, 0, 24)
+                  }
+                  layout.addView(loopSwitch)
+
+                  val dirGroup = RadioGroup(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                  }
+                  val verticalRadio = RadioButton(this).apply {
+                      id = 1001
+                      text = "上下滑動模式（往下翻頁，到底後往上劃回第 1 頁）"
+                  }
+                  val horizontalRadio = RadioButton(this).apply {
+                      id = 1002
+                      text = "左右滑動模式（往左滑下一頁，到底後往右劃回第 1 頁）"
+                  }
+                  dirGroup.addView(verticalRadio)
+                  dirGroup.addView(horizontalRadio)
+                  dirGroup.check(if (prefs.isVertical) 1001 else 1002)
+                  layout.addView(dirGroup)
+
+                  val saveBtn = Button(this).apply {
+                      text = "儲存設定"
+                      setOnClickListener {
+                          prefs.totalPages = totalPagesInput.text.toString().toIntOrNull() ?: 10
+                          prefs.intervalMs = intervalInput.text.toString().toLongOrNull() ?: 5000L
+                          prefs.rewindStepMs = rewindInput.text.toString().toLongOrNull() ?: 350L
+                          prefs.isLoopEnabled = loopSwitch.isChecked
+                          prefs.isVertical = (dirGroup.checkedRadioButtonId == 1001)
+                          Toast.makeText(this@MainActivity, "設定已儲存並同步至懸浮窗！", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  layout.addView(saveBtn)
+
+                  val accBtn = Button(this).apply {
+                      text = "前往開啟【無障礙服務】"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  }
+                  layout.addView(accBtn)
+
+                  root.addView(layout)
+                  setContentView(root)
+              }
+          }
+          EOF
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PagePilot-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
